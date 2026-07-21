@@ -1,11 +1,9 @@
 import re
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
 
 import streamlit as st
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain_core.prompts import PromptTemplate
-from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 
 MODEL_NAME = "gemma4:e4b"
@@ -14,43 +12,28 @@ WIKI_DIR = OBSIDIAN_DIR / "AI Wiki"
 INDEX_FILE = WIKI_DIR / "index.md"
 VAULT_NAME = OBSIDIAN_DIR.name
 
-AGENT_PROMPT = """
-You answer questions from a local Obsidian wiki.
+ANSWER_PROMPT = """
+당신은 로컬 옵시디언 위키를 바탕으로 질문에 답하는 비서입니다.
+다음 컨텍스트만 사용해서 질문에 간단하고 정확하게 답하세요.
+답변은 한국어로 하고, 관련 문서 이름을 함께 적어주세요.
+컨텍스트가 부족하면 그 사실을 명확히 말하세요.
 
-You have access to the following tools:
-{tools}
+컨텍스트:
+{context}
 
-Use the following format:
+질문:
+{question}
 
-Question: the input question you must answer
-Thought: you should always think about what to do
-Action: the action to take, should be one of [{tool_names}]
-Action Input: the input to the action
-Observation: the result of the action
-... (this Thought/Action/Action Input/Observation can repeat N times)
-Thought: I now know the final answer
-Final Answer: the final answer to the original input question
-
-Question: {input}
-Thought:
-{agent_scratchpad}
+답변:
 """
+
 
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
-def write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content.strip() + "\n", encoding="utf-8")
-
-
 def build_wiki_path(path: Path) -> str:
     return str(path.relative_to(WIKI_DIR).with_suffix("")).replace("\\", "/")
-
-
-def build_wiki_link(wiki_path: str) -> str:
-    return f"[[{wiki_path}]]"
 
 
 def build_obsidian_uri(file_path: Path) -> str:
@@ -63,57 +46,54 @@ def build_markdown_link(label: str, file_path: Path) -> str:
     return f"[{label}]({build_obsidian_uri(file_path)})"
 
 
-def get_page_path(wiki_path: str) -> Path:
-    return WIKI_DIR / f"{wiki_path}.md"
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def get_wiki_paths() -> list[str]:
-    return sorted(
-        build_wiki_path(path)
-        for path in WIKI_DIR.rglob("*.md")
-        if path != INDEX_FILE
-    )
+@lru_cache(maxsize=1)
+def load_wiki_documents() -> list[tuple[str, str]]:
+    docs: list[tuple[str, str]] = []
+    for path in sorted(WIKI_DIR.rglob("*.md")):
+        rel_path = "index" if path == INDEX_FILE else build_wiki_path(path)
+        docs.append((rel_path, read_text(path)))
+    return docs
 
 
-@tool
-def read_index() -> str:
-    """Read the wiki index. Use this first for every question."""
-    return "\n".join(
-        [
-            f"Citation: {build_markdown_link('index', INDEX_FILE)}",
-            read_text(INDEX_FILE)
-        ]
-    )
+def find_relevant_documents(question: str, top_k: int = 4) -> list[tuple[str, str]]:
+    docs = load_wiki_documents()
+    question_terms = set(re.findall(r"[가-힣a-zA-Z0-9]+", question.lower()))
+    if not question_terms:
+        return docs[:top_k]
+
+    scored_docs: list[tuple[int, str, str]] = []
+    for rel_path, content in docs:
+        document_text = f"{rel_path} {content}".lower()
+        document_terms = set(re.findall(r"[가-힣a-zA-Z0-9]+", document_text))
+        overlap = len(question_terms & document_terms)
+        scored_docs.append((overlap, rel_path, content))
+
+    scored_docs.sort(key=lambda item: item[0], reverse=True)
+    return [(rel_path, content) for _, rel_path, content in scored_docs[:top_k]]
 
 
+def build_context(question: str) -> str:
+    sections: list[str] = []
+    for rel_path, content in find_relevant_documents(question):
+        snippet = normalize_text(content)
+        if len(snippet) > 2200:
+            snippet = snippet[:2200] + "..."
+        sections.append(f"[{rel_path}]\n{snippet}")
+    return "\n\n".join(sections)
 
-@tool
-def list_pages() -> str:
-    """List available wiki page paths excluding index."""
-    return "\n".join(get_wiki_paths())
 
-
-@tool
-def read_page(wiki_path: str) -> str:
-    """Read a wiki page by path like `topics/learning` or `sources/example`."""
-    page_path = get_page_path(wiki_path)
-    return "\n".join(
-        [
-            f"Page: {build_wiki_link(wiki_path)}",
-            f"Citation: {build_markdown_link(wiki_path, page_path)}",
-            read_text(page_path)
-        ]
-    )
+def answer_question(question: str) -> str:
+    context = build_context(question)
+    prompt = ANSWER_PROMPT.format(context=context, question=question)
+    response = model.invoke(prompt)
+    return response.content.strip()
 
 
 model = ChatOllama(model=MODEL_NAME, temperature=0)
-prompt = PromptTemplate.from_template(AGENT_PROMPT)
-agent = create_react_agent(
-    llm=model,
-    tools=[read_index, list_pages, read_page],
-    prompt=prompt,
-)
-wiki_agent = AgentExecutor(agent=agent, tools=[read_index, list_pages, read_page], verbose=True)
 
 st.title("LLM Wiki Agent")
 st.caption("옵시디언 지식베이스에 쿼리하기")
@@ -130,8 +110,8 @@ if question:
     st.session_state["messages"].append({"role": "user", "content": question})
     st.chat_message("user").write(question)
 
-    result = wiki_agent.invoke({"input": question})
+    with st.spinner("답변 생성 중..."):
+        answer = answer_question(question)
 
-    answer = result.get("output", "")
     st.session_state["messages"].append({"role": "assistant", "content": answer})
     st.chat_message("assistant").write(answer)
